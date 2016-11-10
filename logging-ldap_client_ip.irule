@@ -1,0 +1,13 @@
+#!/usr/bin/env tclsh
+
+# This iRule requires that a high speed logging pool be configured on the LTM (example: hsl_destination).
+
+when SERVER_CONNECTED {
+	set hsl [HSL::open -proto UDP -pool hsl_destination]
+
+	# Must perform a catch on the HSL to prevent a runtime error and vitual server failure if the syslog pool is unavailable:
+	if { [catch { HSL::send $hsl "log=hsl irule=logging-ldap_client_ip client_ip=[clientside {IP::remote_addr}], client_port=[clientside {TCP::remote_port}], virtual_server=[clientside {IP::local_addr}]:[clientside {TCP::local_port}], snat_ip=[serverside {IP::local_addr}], snat_port=[serverside {TCP::local_port}], ldap_server=[serverside {IP::remote_addr}]" } errstr] } {
+		# Do nothing if the HSL fails to prevent the local log from getting flooded.
+	}
+
+}

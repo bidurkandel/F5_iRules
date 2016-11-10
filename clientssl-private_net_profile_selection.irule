@@ -1,0 +1,14 @@
+#!/usr/bin/env tclsh
+
+# This iRule allows for different Client-SSL profiles to be presented based on
+# the source IP. The example used here is to use one profile for internal
+# clients and another for external clients.
+
+when CLIENT_ACCEPTED {
+   if { [class match [IP::client_addr] equals "private_net"] } {
+      SSL::profile clientssl-private
+   }
+   else {
+      SSL::profile clientssl-public
+   }
+}
