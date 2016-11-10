@@ -1,0 +1,130 @@
+#!/usr/bin/env tclsh
+
+# This iRule is based on one contributed to DevCentral: https://devcentral.f5.com/wiki/iRules.HTTP-URI-Request-Limiter.ashx
+
+# This iRule was created to throttle HTTP requests into a VIP. All HTTP requests are processed against the throttling logic.
+# The blocking key is the combination of client IP, JSESSIONID, HTTP Host, and HTTP URI. If JSESSIONID is not present the
+# blocking key is client IP, HTTP Host, and HTTP URI which could potentially block all clients behind a NAT'd address.
+
+# Two levels of banning are utilized, a short ban and a long ban. The short ban of BAN_SHORT seconds is configured to trigger
+# blocking once MAX_REQS number of requests for the same URI are received within TIMEOUT_SHORT seconds. The long ban of
+# BAN_LONG is triggered if the short ban is triggered MAX_BANS times within TIMEOUT_LONG seconds.
+
+# PRE-REQUISITES
+# This iRule requires that the following items also be configured:
+# 1) A HSL pool must be configured on the LTM (called "hsl_splunk" in this iRule).
+# 2) A whitelist datagroup must be configured. The name of the datagroup naming convenstion should be
+# "WHITELIST-HTTP_URI_RATE-LIMITER-vip_or_application_name". This name will need to be updated in the iRule when it is implemented for the
+# specific VIP. The configuration of the datagroup should be:
+# ltm data-group internal WHITELIST-HTTP_URI_RATE-LIMITER {
+#   records {
+#      10.10.10.10/32 { }
+#   }
+#   type ip
+# }
+
+when CLIENT_ACCEPTED {
+	set hsl [HSL::open -proto UDP -pool hsl_splunk]
+}
+when HTTP_REQUEST {
+	set ip_addr [IP::client_addr]
+	set vip [IP::local_addr]:[TCP::local_port]
+	set http_host [HTTP::host]
+	set http_uri [HTTP::uri]
+#	Extract the jsessionid when present in the URI and not as a cookie:
+	if {[HTTP::cookie exists "JSESSIONID"]} {
+		set jsessionid [HTTP::cookie "JSESSIONID"]
+	}
+	else {
+		set jsessionid [findstr [string tolower [HTTP::uri]] ";jsessionid=" 12 ";"]
+	}
+
+	# 0 - NONE, 1 - LOW, 2 - MEDIUM, 3 - VERBOSE
+	set DEBUG_LEVEL 2
+
+	# Client IP whitelist:
+	if { ( [class match $ip_addr equals WHITELIST-HTTP_URI_RATE-LIMITER ] )  } {
+		if { $DEBUG_LEVEL >= 3 } {
+			HSL::send $hsl "log=hsl irule=waf-http_uri_rate_limiter client_ip=$ip_addr vip=$vip http_host=$http_host http_uri=$http_uri JSESSIONID=$jsessionid client_state=whitelisted"
+			#log local0. "log=local irule=waf-http_uri_rate_limiter client_ip=$ip_addr vip=$vip http_host=$http_host http_uri=$http_uri JSESSIONID=$jsessionid client_state=whitelisted"
+		}
+		return
+	}
+
+	# Short banning parameters (seconds):
+	# Number of requests:
+	set MAX_REQS 20
+	# Timespan of requests:
+	set TIMEOUT_SHORT 10
+	# Ban for:
+	set BAN_SHORT 10
+
+	# Long banning parameters (seconds):
+	# Number of short bans:
+	set MAX_BANS 3
+	# Timespan of short bans:
+	set TIMEOUT_LONG 150
+	# Ban for:
+	set BAN_LONG 300
+
+	#set MONITOR_TBL limit_monitor
+  set tbl "limit_$ip_addr-$vip-$http_host$http_uri$jsessionid"
+
+	set banTime [table lookup -notouch -subtable $tbl banTime ]
+	if { $banTime > 0 } {
+		if { $DEBUG_LEVEL >= 2 } {
+			HSL::send $hsl "log=hsl irule=waf-http_uri_rate_limiter client_ip=$ip_addr vip=$vip http_host=$http_host http_uri=$http_uri JSESSIONID=$jsessionid client_state=banned action=drop ban_duration=$banTime ban_remaining=[table timeout -subtable $tbl -remaining banTime]"
+			#log local0. "log=local irule=waf-http_uri_rate_limiter client_ip=$ip_addr vip=$vip http_host=$http_host http_uri=$http_uri JSESSIONID=$jsessionid client_state=banned action=drop ban_duration=$banTime ban_remaining=[table timeout -subtable $tbl -remaining banTime]"
+		}
+
+		# Drop packets
+		drop
+
+		# disable events for this connection
+		event disable all
+		return
+	}
+
+	set requestCnt [table lookup -notouch -subtable $tbl requestCnt]
+
+	if { $requestCnt == "" } {
+		# set the lifetime timeout value so request will go away after a set amount of time
+		set requestCnt [ table set -subtable $tbl requestCnt 1 $TIMEOUT_SHORT ]
+	} else {
+		set requestCnt [ table incr -subtable $tbl requestCnt ]
+
+		# Check if too many request
+		if { $requestCnt >  $MAX_REQS } {
+			# Set the short ban time and remove "requestCnt" subtable
+			set banTime $BAN_SHORT
+			table delete -subtable $tbl requestCnt
+
+			# Count how many times we have short banned them
+			set banCnt [table lookup -notouch -subtable $tbl banCnt]
+			if { $banCnt == "" } {
+				table set -subtable $tbl banCnt 1 $TIMEOUT_LONG
+			} else {
+				set banCnt [table incr -subtable $tbl banCnt]
+				# Check if we need to ban them for longer
+				if { $banCnt > $MAX_BANS } {
+					set banTime $BAN_LONG
+				}
+			}
+
+			# Ban them for $banTime
+			table set -subtable $tbl banTime $banTime $banTime
+			#table set -subtable $MONITOR_TBL "$tbl" "JSESSIONID: $jsessionid; Ban:$banTime secs" $banTime
+
+			if { $DEBUG_LEVEL >= 1 } {
+				HSL::send $hsl "log=hsl irule=waf-http_uri_rate_limiter client_ip=$ip_addr vip=$vip http_host=$http_host http_uri=$http_uri JSESSIONID=$jsessionid client_state=allowed action=ban ban_duration=$banTime"
+				#log local0. "log=local irule=waf-http_uri_rate_limiter client_ip=$ip_addr vip=$vip http_host=$http_host http_uri=$http_uri JSESSIONID=$jsessionid client_state=allowed action=ban ban_duration=$banTime"
+			}
+		}
+	}
+
+	# DEBUG INFO
+	if { $DEBUG_LEVEL >= 3 } {
+		HSL::send $hsl "log=hsl irule=waf-http_uri_rate_limiter client_ip=$ip_addr vip=$vip http_host=$http_host http_uri=$http_uri JSESSIONID=$jsessionid request_count=[table lookup -notouch -subtable $tbl requestCnt] ban_count=[table lookup -notouch -subtable $tbl banCnt] ban_duration=[table lookup -notouch -subtable $tbl banTime]"
+		#log local0. "log=local irule=waf-http_uri_rate_limiter client_ip=$ip_addr vip=$vip http_host=$http_host http_uri=$http_uri JSESSIONID=$jsessionid request_count=[table lookup -notouch -subtable $tbl requestCnt] ban_count=[table lookup -notouch -subtable $tbl banCnt] ban_duration=[table lookup -notouch -subtable $tbl banTime]"
+	}
+}
