@@ -1,0 +1,7 @@
+#!/usr/bin/env tclsh
+
+# This iRule drops DNS requests sourced from IPs in the "private_net" datagroup.
+
+when DNS_REQUEST {
+    if { ![class match [IP::remote_addr] eq private_net] } { drop }
+}
